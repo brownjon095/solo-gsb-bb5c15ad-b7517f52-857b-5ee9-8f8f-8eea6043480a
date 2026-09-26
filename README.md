@@ -6,7 +6,9 @@
 **allow − deny**，返回与原策略**等价、互不重叠且数量最少**的 CIDR 集合。
 另提供地址判定（`/evaluate`）、策略对比（`/compare`）、规则影响审计
 （`/audit-rules`）、策略最小化（`/minimize-policy`）、子网分配
-（`/allocate`）与地址/网段密钥脱敏（`/anonymize`）接口。
+（`/allocate`）、地址/网段密钥脱敏（`/anonymize`）以及同一 /24 内 IPv4
+网段的反向 DNS 委派计划（`/reverse-delegations`，/24 直接委派、/25～/32
+按 RFC 2317 委派）接口。
 
 - deny 前缀切穿 allow 网段时，按二叉前缀树**递归对半拆分**直到边界对齐；
 - 仅当两个网段构成**完整相邻的兄弟前缀**（同一父网的左右两半）时才合并，
@@ -21,6 +23,10 @@
   多组最少解按保留规则的 `(side, index)` 序列字典序取唯一结果；
 - `/allocate` 在单个 scope 内为多条申请分配互不重叠、避开占用网段的子网，
   按申请顺序取**网络地址序列字典序最小**的完整可行方案（必要时回溯）；
+- `/reverse-delegations` 为同一父 /24 内的多个 **IPv4 /24～/32 网段**生成
+  反向 DNS 委派计划：/24 在 `in-addr.arpa` 区域直接放 NS，/25～/32 按
+  **RFC 2317** 在范围标签子区放 NS，并在父区为覆盖的每个地址生成一条
+  CNAME；网段相交或不在同一 /24 时整批拒绝（422）；
 - 非法 CIDR（格式错误、越界前缀、主机位非零）统一返回 **HTTP 422**。
 
 ## 一条命令启动
@@ -565,6 +571,145 @@ curl -s -X POST http://localhost:8000/anonymize \
 `cidrs` 中出现非法网段、缺少显式前缀长度（裸地址）或**主机位非零**
 （如 `10.0.0.1/24`），统一返回 **HTTP 422**。
 
+### `POST /reverse-delegations`
+
+为**同一父 /24** 内的多个 IPv4 网段生成**反向 DNS 委派计划**。每条请求
+给出一个**严格 CIDR（仅接受 /24～/32，必须显式带前缀长度、主机位为零）**
+及该网段的 NS 域名列表；整批网段必须**两两不相交**且位于**同一个 /24**，
+否则**整批拒绝**（不返回任何部分计划）。
+
+委派方式：
+
+- **/24**：在对应的 `in-addr.arpa` 区域直接放 NS 记录。例如
+  `10.0.0.0/24` → 区域 `0.0.10.in-addr.arpa`，记录
+  `0.0.10.in-addr.arpa. IN NS <NS>`；
+- **/25～/32**（**RFC 2317** 无类委派）：区域边界只能到八位组，无法按
+  CIDR 直接切分反向域，因此在父 /24 区域下新建一个**范围标签子区**
+  `<首地址>-<末地址>.<父区>`，把 NS 记录放在子区顶点；同时在父区为网段
+  **覆盖的每一个地址**生成一条 CNAME，把
+  `<n>.<父区>` 指向 `<n>.<子区>`，由子区提供该地址的 PTR。
+
+请求体：
+
+| 字段                          | 类型       | 说明                                   |
+| ----------------------------- | ---------- | -------------------------------------- |
+| `delegations`                 | `object[]` | 委派列表，可省略（默认 `[]`，返回空计划） |
+| `delegations[].cidr`          | `string`   | **必填**，严格 IPv4 CIDR，仅 `/24`～`/32`；裸地址、IPv6、越界前缀、主机位非零均返回 422 |
+| `delegations[].nameservers`   | `string[]` | **必填且至少 1 个** NS 域名；允许单个结尾点（绝对名，响应中去掉） |
+
+示例（`/30` + `/32`，均在 `192.0.2.0/24` 内）：
+
+```bash
+curl -s -X POST http://localhost:8000/reverse-delegations \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "delegations": [
+          {"cidr": "192.0.2.8/30",
+           "nameservers": ["ns1.example.net", "ns2.example.net"]},
+          {"cidr": "192.0.2.20/32",
+           "nameservers": ["host-20.example.org"]}
+        ]
+      }'
+```
+
+响应（`zones` / `records` 均按**网络地址**排序；同一网段先 NS 后 CNAME，
+CNAME 按主机号升序）：
+
+```json
+{
+  "parent_zone": "2.0.192.in-addr.arpa",
+  "zones": [
+    {"zone": "8-11.2.0.192.in-addr.arpa",
+     "parent_zone": "2.0.192.in-addr.arpa",
+     "kind": "rfc2317", "cidr": "192.0.2.8/30", "index": 0},
+    {"zone": "20-20.2.0.192.in-addr.arpa",
+     "parent_zone": "2.0.192.in-addr.arpa",
+     "kind": "rfc2317", "cidr": "192.0.2.20/32", "index": 1}
+  ],
+  "records": [
+    {"zone": "8-11.2.0.192.in-addr.arpa", "type": "NS",
+     "name": "8-11.2.0.192.in-addr.arpa", "target": "ns1.example.net",
+     "cidr": "192.0.2.8/30", "index": 0},
+    {"zone": "8-11.2.0.192.in-addr.arpa", "type": "NS",
+     "name": "8-11.2.0.192.in-addr.arpa", "target": "ns2.example.net",
+     "cidr": "192.0.2.8/30", "index": 0},
+    {"zone": "2.0.192.in-addr.arpa", "type": "CNAME",
+     "name": "8.2.0.192.in-addr.arpa",
+     "target": "8.8-11.2.0.192.in-addr.arpa",
+     "cidr": "192.0.2.8/30", "index": 0},
+    {"zone": "2.0.192.in-addr.arpa", "type": "CNAME",
+     "name": "9.2.0.192.in-addr.arpa",
+     "target": "9.8-11.2.0.192.in-addr.arpa",
+     "cidr": "192.0.2.8/30", "index": 0},
+    {"zone": "2.0.192.in-addr.arpa", "type": "CNAME",
+     "name": "10.2.0.192.in-addr.arpa",
+     "target": "10.8-11.2.0.192.in-addr.arpa",
+     "cidr": "192.0.2.8/30", "index": 0},
+    {"zone": "2.0.192.in-addr.arpa", "type": "CNAME",
+     "name": "11.2.0.192.in-addr.arpa",
+     "target": "11.8-11.2.0.192.in-addr.arpa",
+     "cidr": "192.0.2.8/30", "index": 0},
+    {"zone": "20-20.2.0.192.in-addr.arpa", "type": "NS",
+     "name": "20-20.2.0.192.in-addr.arpa", "target": "host-20.example.org",
+     "cidr": "192.0.2.20/32", "index": 1},
+    {"zone": "2.0.192.in-addr.arpa", "type": "CNAME",
+     "name": "20.2.0.192.in-addr.arpa",
+     "target": "20.20-20.2.0.192.in-addr.arpa",
+     "cidr": "192.0.2.20/32", "index": 1}
+  ]
+}
+```
+
+/24 直接委派只产生父区顶点的 NS（无子区、无 CNAME）：
+
+```bash
+curl -s -X POST http://localhost:8000/reverse-delegations \
+  -H 'Content-Type: application/json' \
+  -d '{"delegations": [
+        {"cidr": "10.0.0.0/24", "nameservers": ["ns1.example.net"]}
+      ]}'
+```
+
+```json
+{
+  "parent_zone": "0.0.10.in-addr.arpa",
+  "zones": [
+    {"zone": "0.0.10.in-addr.arpa", "parent_zone": "0.0.10.in-addr.arpa",
+     "kind": "direct", "cidr": "10.0.0.0/24", "index": 0}
+  ],
+  "records": [
+    {"zone": "0.0.10.in-addr.arpa", "type": "NS",
+     "name": "0.0.10.in-addr.arpa", "target": "ns1.example.net",
+     "cidr": "10.0.0.0/24", "index": 0}
+  ]
+}
+```
+
+字段说明：
+
+- `parent_zone`：整批网段共享的父 /24 反向区域（空批为 `null`）；
+- `zones[]`：每个输入网段一条，按网络地址排序；`kind` 为
+  `direct`（/24）或 `rfc2317`（/25～/32）；`index` 为该网段在请求中的
+  0 基下标；
+- `records[]`：生成的全部记录，按**网络地址**排序（同网段 NS 在前、
+  CNAME 按主机号升序）：
+  - /24：父区顶点 NS（`zone`/`name` 即父区）；
+  - /25～/32：子区顶点 NS（`zone`/`name` 为范围标签子区）+ 父区中每个
+    覆盖地址一条 CNAME（`zone` 为父区，`target` 指向子区内对应名称）；
+  - 每条记录都带 `cidr` 与 `index`，可回溯到对应的输入网段。
+
+其他要点：
+
+- 范围标签取网段**主机号首末值**：如 `192.0.2.128/25` → `128-255`、
+  `192.0.2.20/32` → `20-20`；
+- 空批（`{"delegations": []}` 或 `{}`）返回
+  `{"parent_zone": null, "zones": [], "records": []}`；
+- NS 域名结尾的单个点（绝对名写法）会被去掉；非法域名（空、空格、非法
+  字符、标签以连字符开头/结尾等）返回 422；
+- 网段**相交（含相同、包含）**或**不在同一父 /24**、CIDR 不是 IPv4、
+  前缀不在 /24～/32、缺前缀长度、主机位非零、NS 列表为空，统一返回
+  **HTTP 422** 且不返回任何记录。
+
 ## 算法说明
 
 1. **解析校验**：`ipaddress.ip_network(value, strict=True)` 严格解析；
@@ -650,6 +795,23 @@ scope 的最大 CIDR 瓦片，每块直接携带**获胜条目本体**（无获�
 3. CIDR 仅对网络地址做上述变换，随后用原前缀长度重新掩码清零主机位，得到
    规范网段；IPv4、IPv6 用不同族标记做域分离，两类输出各自保持输入顺序。
 
+`/reverse-delegations` 只做网段到反向域名的确定性映射
+（`app/policy.py` 中 `reverse_delegations` / `parse_reverse_cidr` /
+`parse_nameserver`）：
+
+1. 每条 CIDR 严格解析为 IPv4 网络并限定前缀在 /24～/32；整批网段必须位于
+   同一父 /24（取 `supernet(new_prefix=24)` 比较），按网络地址排序后逐对
+   检查 `overlaps`，任一对相交即拒绝整批；
+2. /24 直接委派：父区名由高三个八位组反排拼成 `<c>.<b>.<a>.in-addr.arpa`，
+   在该区顶点为每个 NS 生成一条 NS 记录；
+3. /25～/32 按 RFC 2317：取网段主机号首末值组成范围标签 `<first>-<last>`，
+   子区名为 `<first>-<last>.<父区>`，NS 记录放在子区顶点；再为
+   `first..last` 的每个主机号在父区生成
+   `<n>.<父区> CNAME <n>.<first>-<last>.<父区>`（/32 即单地址 `n-n` 标签、
+   单条 CNAME）；
+4. `zones` 与 `records` 按网络地址排序，同网段 NS 先于 CNAME、CNAME 按主机号
+   升序；每条输出都带 `cidr` 与输入 `index`，保留输入网段与记录的对应关系。
+
 ## 本地开发（不使用 Docker）
 
 需要 Python 3.11+：
@@ -674,11 +836,11 @@ pytest -q
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate、/anonymize
-│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、最少规则子集搜索、子网分配搜索、前缀保持 HMAC 脱敏（仅 ipaddress + hmac/hashlib）
+│   ├── main.py        # FastAPI 应用：GET /health、POST /normalize、/evaluate、/compare、/audit-rules、/minimize-policy、/allocate、/anonymize、/reverse-delegations
+│   ├── policy.py      # 解析、递归拆分、兄弟合并、统计、最长前缀匹配、获胜者分区、规则审计、分区对比、最少规则子集搜索、子网分配搜索、前缀保持 HMAC 脱敏、/24 与 RFC 2317 反向委派计划（仅 ipaddress + hmac/hashlib）
 │   └── schemas.py     # Pydantic 请求/响应模型与 422 校验
 ├── tests/
-│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/minimize-policy 子集暴力枚举对拍、/allocate 暴力枚举对拍、/anonymize 双射/最长公共前缀保持性质与独立参考实现对拍）
+│   ├── test_policy.py # 核心算法单测 + 随机对拍（含 /compare、/audit-rules 逐地址对拍、/minimize-policy 子集暴力枚举对拍、/allocate 暴力枚举对拍、/anonymize 双射/最长公共前缀保持性质与独立参考实现对拍、/reverse-delegations 随机分区覆盖/排序/对应关系）
 │   └── test_api.py    # API 层测试（422、409、统计、空请求等）
 ├── Dockerfile
 ├── docker-compose.yml

@@ -1192,3 +1192,262 @@ def test_anonymize_is_documented_in_openapi():
     assert "host_bits_set" in examples
     schema = spec["components"]["schemas"]["AnonymizeResponse"]
     assert set(schema["properties"]) == {"addresses", "cidrs"}
+
+
+# --------------------------------------------------------------------------
+# POST /reverse-delegations
+# --------------------------------------------------------------------------
+
+
+def test_reverse_delegations_rfc2317_basic():
+    response = client.post(
+        "/reverse-delegations",
+        json={
+            "delegations": [
+                {"cidr": "192.0.2.8/30",
+                 "nameservers": ["ns1.example.net", "ns2.example.net"]},
+                {"cidr": "192.0.2.20/32",
+                 "nameservers": ["host-20.example.org"]},
+            ],
+        },
+    )
+    assert response.status_code == 200
+    data = response.json()
+    parent = "2.0.192.in-addr.arpa"
+    assert data["parent_zone"] == parent
+    assert data["zones"] == [
+        {"zone": f"8-11.{parent}", "parent_zone": parent,
+         "kind": "rfc2317", "cidr": "192.0.2.8/30", "index": 0},
+        {"zone": f"20-20.{parent}", "parent_zone": parent,
+         "kind": "rfc2317", "cidr": "192.0.2.20/32", "index": 1},
+    ]
+    assert data["records"][0] == {
+        "zone": f"8-11.{parent}", "type": "NS",
+        "name": f"8-11.{parent}", "target": "ns1.example.net",
+        "cidr": "192.0.2.8/30", "index": 0,
+    }
+    assert data["records"][1]["target"] == "ns2.example.net"
+    cnames_8_30 = [r for r in data["records"]
+                  if r["type"] == "CNAME" and r["cidr"] == "192.0.2.8/30"]
+    assert [r["name"] for r in cnames_8_30] == [
+        f"{h}.{parent}" for h in range(8, 12)
+    ]
+    assert cnames_8_30[0]["target"] == f"8.8-11.{parent}"
+    assert data["records"][-1] == {
+        "zone": parent, "type": "CNAME",
+        "name": f"20.{parent}", "target": f"20.20-20.{parent}",
+        "cidr": "192.0.2.20/32", "index": 1,
+    }
+
+
+def test_reverse_delegations_direct_slash24():
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [
+            {"cidr": "10.0.0.0/24", "nameservers": ["ns1.example.net."]},
+        ]},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    zone = "0.0.10.in-addr.arpa"
+    assert data == {
+        "parent_zone": zone,
+        "zones": [{"zone": zone, "parent_zone": zone, "kind": "direct",
+                   "cidr": "10.0.0.0/24", "index": 0}],
+        "records": [
+            {"zone": zone, "type": "NS", "name": zone,
+             "target": "ns1.example.net", "cidr": "10.0.0.0/24", "index": 0},
+        ],
+    }
+
+
+def test_reverse_delegations_empty_batch():
+    response = client.post("/reverse-delegations", json={})
+    assert response.status_code == 200
+    assert response.json() == {
+        "parent_zone": None, "zones": [], "records": [],
+    }
+
+
+def test_reverse_delegations_sorted_by_network_address():
+    # Deliberately reversed input order.
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [
+            {"cidr": "192.0.2.200/30", "nameservers": ["d.example"]},
+            {"cidr": "192.0.2.64/26", "nameservers": ["b.example"]},
+            {"cidr": "192.0.2.0/26", "nameservers": ["a.example"]},
+        ]},
+    )
+    assert response.status_code == 200
+    zones = response.json()["zones"]
+    assert [z["cidr"] for z in zones] == [
+        "192.0.2.0/26", "192.0.2.64/26", "192.0.2.200/30",
+    ]
+    # The index field keeps the original input position.
+    assert [z["index"] for z in zones] == [2, 1, 0]
+    # First record of each block is its NS; blocks appear address-sorted.
+    records = response.json()["records"]
+    first_per_block = {}
+    for record in records:
+        first_per_block.setdefault(record["cidr"], record["type"])
+    block_order = []
+    seen = set()
+    for record in records:
+        if record["cidr"] not in seen:
+            block_order.append(record["cidr"])
+            seen.add(record["cidr"])
+    assert block_order == [
+        "192.0.2.0/26", "192.0.2.64/26", "192.0.2.200/30",
+    ]
+    # CNAMEs inside a block ascend by host octet.
+    cnames = [r for r in records if r["type"] == "CNAME"
+              and r["cidr"] == "192.0.2.64/26"]
+    assert [r["name"].split(".", 1)[0] for r in cnames] == [
+        str(h) for h in range(64, 128)
+    ]
+
+
+def test_reverse_delegations_overlapping_networks_returns_422():
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [
+            {"cidr": "192.0.2.0/25", "nameservers": ["a.example.net"]},
+            {"cidr": "192.0.2.64/26", "nameservers": ["b.example.net"]},
+        ]},
+    )
+    assert response.status_code == 422
+    assert "overlap" in response.json()["detail"][0]["msg"]
+
+
+def test_reverse_delegations_duplicate_cidr_returns_422():
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [
+            {"cidr": "192.0.2.0/30", "nameservers": ["a.example.net"]},
+            {"cidr": "192.0.2.0/30", "nameservers": ["b.example.net"]},
+        ]},
+    )
+    assert response.status_code == 422
+    assert "overlap" in response.json()["detail"][0]["msg"]
+
+
+def test_reverse_delegations_slash24_with_child_returns_422():
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [
+            {"cidr": "192.0.2.0/24", "nameservers": ["a.example.net"]},
+            {"cidr": "192.0.2.128/25", "nameservers": ["b.example.net"]},
+        ]},
+    )
+    assert response.status_code == 422
+    assert "overlap" in response.json()["detail"][0]["msg"]
+
+
+def test_reverse_delegations_different_parent_24_returns_422():
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [
+            {"cidr": "192.0.2.0/25", "nameservers": ["a.example.net"]},
+            {"cidr": "192.0.3.0/25", "nameservers": ["b.example.net"]},
+        ]},
+    )
+    assert response.status_code == 422
+    assert "shared parent /24" in response.json()["detail"][0]["msg"]
+
+
+@pytest.mark.parametrize(
+    "bad_cidr",
+    [
+        "192.0.2.0/23",      # prefix too short
+        "192.0.2.0/33",      # prefix too long
+        "192.0.2.1/24",      # host bits
+        "192.0.2.1",         # bare address
+        "2001:db8::/120",    # IPv6
+        "2001:db8::/128",    # IPv6 host prefix
+        "bogus",
+    ],
+)
+def test_reverse_delegations_invalid_cidr_returns_422(bad_cidr):
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [
+            {"cidr": bad_cidr, "nameservers": ["ns.example.net"]},
+        ]},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert any(err["loc"][-1] == "cidr" for err in detail)
+
+
+def test_reverse_delegations_missing_cidr_returns_422():
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [{"nameservers": ["ns.example.net"]}]},
+    )
+    assert response.status_code == 422
+
+
+def test_reverse_delegations_empty_nameservers_returns_422():
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [{"cidr": "192.0.2.0/24", "nameservers": []}]},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert any(err["loc"][-1] == "nameservers" for err in detail)
+
+
+def test_reverse_delegations_invalid_nameserver_returns_422():
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [
+            {"cidr": "192.0.2.0/24", "nameservers": ["bad name"]},
+        ]},
+    )
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert any(err["loc"][-1] == "nameservers" for err in detail)
+
+
+def test_reverse_delegations_wrong_types_return_422():
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [
+            {"cidr": 10, "nameservers": ["ns.example.net"]},
+        ]},
+    )
+    assert response.status_code == 422
+
+    response = client.post(
+        "/reverse-delegations",
+        json={"delegations": [
+            {"cidr": "192.0.2.0/24", "nameservers": [10]},
+        ]},
+    )
+    assert response.status_code == 422
+
+    response = client.post(
+        "/reverse-delegations", json={"delegations": "not-a-list"}
+    )
+    assert response.status_code == 422
+
+
+def test_reverse_delegations_is_documented_in_openapi():
+    spec = client.get("/openapi.json").json()
+    assert "/reverse-delegations" in spec["paths"]
+    operation = spec["paths"]["/reverse-delegations"]["post"]
+    assert "422" in operation["responses"]
+    examples = operation["requestBody"]["content"]["application/json"][
+        "examples"
+    ]
+    assert "rfc2317_mixed_lengths" in examples
+    assert "overlapping_networks" in examples
+    response_schema = spec["components"]["schemas"]["ReverseDelegationsResponse"]
+    assert set(response_schema["properties"]) == {
+        "parent_zone", "zones", "records",
+    }
+    zone_schema = spec["components"]["schemas"]["DelegationZone"]
+    assert zone_schema["properties"]["kind"]["enum"] == ["direct", "rfc2317"]
+    record_schema = spec["components"]["schemas"]["DelegationRecord"]
+    assert record_schema["properties"]["type"]["enum"] == ["NS", "CNAME"]

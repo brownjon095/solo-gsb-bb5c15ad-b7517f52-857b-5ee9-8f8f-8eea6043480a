@@ -11,8 +11,11 @@ from app.policy import (
     _MAX_PREFIXLEN,
     parse_address,
     parse_key_hex,
+    parse_nameserver,
     parse_network,
+    parse_reverse_cidr,
     parse_strict_cidr,
+    validate_reverse_delegations,
 )
 
 
@@ -496,5 +499,124 @@ class AnonymizeResponse(BaseModel):
         description=(
             "Anonymized canonical network segments, one per input CIDR, in "
             "input order, each keeping the original prefix length."
+        ),
+    )
+
+
+class ReverseDelegationRequest(BaseModel):
+    cidr: str = Field(
+        description=(
+            "Strict IPv4 CIDR with prefix length /24../32; host bits must be "
+            "zero. Every entry of one batch must share the same parent /24."
+        ),
+    )
+    nameservers: list[str] = Field(
+        min_length=1,
+        description=(
+            "NS owner names for the delegation, in record order; at least one "
+            "is required. A single trailing dot is accepted and stripped."
+        ),
+    )
+
+    @field_validator("cidr")
+    @classmethod
+    def _validate_cidr(cls, value: str) -> str:
+        # Raises ValueError for IPv6, prefixes outside /24../32, bare
+        # addresses and host bits; FastAPI turns that into HTTP 422.
+        parse_reverse_cidr(value)
+        return value
+
+    @field_validator("nameservers")
+    @classmethod
+    def _validate_nameservers(cls, values: list[str]) -> list[str]:
+        for value in values:
+            parse_nameserver(value)
+        return values
+
+
+class ReverseDelegationsRequest(BaseModel):
+    delegations: list[ReverseDelegationRequest] = Field(
+        default_factory=list,
+        description=(
+            "CIDR/NS pairs to delegate, all sharing one parent /24 and "
+            "pairwise non-overlapping; any overlap rejects the whole batch."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_batch(self) -> "ReverseDelegationsRequest":
+        # Shared-/24 and non-overlap checks span entries, so they cannot be
+        # expressed by per-field validators. A ValueError here is an HTTP 422.
+        validate_reverse_delegations(
+            [item.cidr for item in self.delegations],
+            [item.nameservers for item in self.delegations],
+        )
+        return self
+
+
+class DelegationZone(BaseModel):
+    zone: str = Field(
+        description=(
+            "in-addr.arpa zone to operate on. Equals parent_zone for a direct "
+            "/24 delegation; for RFC 2317 it is the range-labelled sub-zone."
+        ),
+    )
+    parent_zone: str = Field(
+        description="Parent /24 in-addr.arpa zone (e.g. 0.0.10.in-addr.arpa).",
+    )
+    kind: Literal["direct", "rfc2317"] = Field(
+        description=(
+            "'direct' for a /24 (NS records in the parent zone); 'rfc2317' "
+            "for /25../32 (NS in a range-labelled sub-zone, CNAMEs in parent)."
+        ),
+    )
+    cidr: str = Field(description="Canonical CIDR of the input delegation.")
+    index: int = Field(
+        description="0-based position of the delegation in the input list.",
+    )
+
+
+class DelegationRecord(BaseModel):
+    zone: str = Field(
+        description=(
+            "Zone the record belongs in: the parent zone for direct NS and "
+            "RFC 2317 CNAME records, the range-labelled sub-zone for its NS."
+        ),
+    )
+    type: Literal["NS", "CNAME"] = Field(description="DNS record type.")
+    name: str = Field(
+        description="Owner name of the record (zone apex for NS).",
+    )
+    target: str = Field(
+        description=(
+            "NS domain name (NS records) or canonical target (CNAME records)."
+        ),
+    )
+    cidr: str = Field(
+        description="Input CIDR this record was generated for.",
+    )
+    index: int = Field(
+        description=(
+            "0-based position of the owning delegation in the input list."
+        ),
+    )
+
+
+class ReverseDelegationsResponse(BaseModel):
+    parent_zone: str | None = Field(
+        description=(
+            "Shared parent /24 in-addr.arpa zone of the batch; null for an "
+            "empty batch."
+        ),
+    )
+    zones: list[DelegationZone] = Field(
+        description=(
+            "One entry per input delegation, sorted by network address."
+        ),
+    )
+    records: list[DelegationRecord] = Field(
+        description=(
+            "All generated records, sorted by network address: NS records "
+            "first (input order), then CNAMEs in ascending host-octet order."
         ),
     )
