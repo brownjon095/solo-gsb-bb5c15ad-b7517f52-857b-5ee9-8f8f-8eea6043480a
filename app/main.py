@@ -1,5 +1,6 @@
 """FastAPI application exposing POST /normalize, /evaluate, /compare,
-/audit-rules, /minimize-policy, /allocate and /anonymize."""
+/audit-rules, /minimize-policy, /allocate, /anonymize and
+/reverse-delegations."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from app.policy import (
     evaluate,
     minimize_policy,
     normalize,
+    reverse_delegations,
 )
 from app.schemas import (
     AddressDecision,
@@ -29,6 +31,8 @@ from app.schemas import (
     MinimizePolicyResponse,
     NormalizeResponse,
     PolicyRequest,
+    ReverseDelegationsRequest,
+    ReverseDelegationsResponse,
 )
 
 app = FastAPI(
@@ -42,10 +46,13 @@ app = FastAPI(
         "one scope; minimize an allow/deny list to the smallest subset "
         "equivalent inside one scope; allocate non-overlapping subnets "
         "for a list of requests inside one scope, avoiding already-occupied "
-        "CIDRs; and prefix-preservingly anonymize bare IPv4/IPv6 addresses "
-        "and strict CIDRs with an HMAC-SHA256 key for safe list sharing."
+        "CIDRs; prefix-preservingly anonymize bare IPv4/IPv6 addresses "
+        "and strict CIDRs with an HMAC-SHA256 key for safe list sharing; "
+        "and plan reverse-DNS delegations for the IPv4 networks of one /24 "
+        "(direct in-addr.arpa NS for a /24, RFC 2317 range-label subzones "
+        "plus per-address CNAMEs for /25-/32)."
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -601,3 +608,221 @@ def allocate_subnets(request: AllocateRequest) -> dict:
 )
 def anonymize_addresses(request: AnonymizeRequest) -> dict:
     return anonymize(request.key_hex, request.addresses, request.cidrs)
+
+
+@app.post(
+    "/reverse-delegations",
+    response_model=ReverseDelegationsResponse,
+    tags=["policy"],
+    summary="Plan reverse-DNS delegations for IPv4 /24-/32 networks in one /24",
+    openapi_extra={
+        # See /evaluate: named body examples survive only via openapi_extra
+        # for model-typed parameters.
+        "requestBody": {
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "direct_slash24": {
+                            "summary": (
+                                "A /24 delegates its in-addr.arpa zone "
+                                "directly with NS records"
+                            ),
+                            "value": {
+                                "delegations": [
+                                    {"cidr": "192.0.2.0/24",
+                                     "nameservers": ["ns1.example.net",
+                                                     "ns2.example.net"]},
+                                ],
+                            },
+                        },
+                        "rfc2317_subzones": {
+                            "summary": (
+                                "Disjoint /25-/32 networks in one /24 use RFC "
+                                "2317 range labels, each with NS records and "
+                                "per-address parent-zone CNAMEs"
+                            ),
+                            "value": {
+                                "delegations": [
+                                    {"cidr": "10.0.0.128/30",
+                                     "nameservers": ["ns1.cust.example",
+                                                     "ns2.cust.example"]},
+                                    {"cidr": "10.0.0.5/32",
+                                     "nameservers": ["host-5.example.org"]},
+                                ],
+                            },
+                        },
+                        "overlapping_cidrs_rejected": {
+                            "summary": "Intersecting CIDRs -> HTTP 422, whole batch rejected",
+                            "value": {
+                                "delegations": [
+                                    {"cidr": "10.0.0.0/25",
+                                     "nameservers": ["ns1.example.net"]},
+                                    {"cidr": "10.0.0.64/26",
+                                     "nameservers": ["ns2.example.net"]},
+                                ],
+                            },
+                        },
+                        "different_parent_24_rejected": {
+                            "summary": "CIDRs from two /24s -> HTTP 422",
+                            "value": {
+                                "delegations": [
+                                    {"cidr": "10.0.0.0/25",
+                                     "nameservers": ["ns1.example.net"]},
+                                    {"cidr": "10.0.1.0/25",
+                                     "nameservers": ["ns2.example.net"]},
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    },
+    responses={
+        200: {
+            "description": (
+                "One delegated zone per input CIDR plus the NS/CNAME records, "
+                "sorted by network address; each record carries its source "
+                "input CIDR."
+            ),
+            "content": {
+                "application/json": {
+                    "examples": {
+                        "direct_slash24": {
+                            "summary": "Direct in-addr.arpa NS delegation for a /24",
+                            "value": {
+                                "zones": [{
+                                    "zone": "2.0.192.in-addr.arpa.",
+                                    "method": "direct",
+                                    "parent_zone": None,
+                                    "cidr": "192.0.2.0/24",
+                                    "nameservers": [
+                                        "ns1.example.net.",
+                                        "ns2.example.net.",
+                                    ],
+                                }],
+                                "records": [
+                                    {
+                                        "zone": "2.0.192.in-addr.arpa.",
+                                        "type": "NS",
+                                        "name": "2.0.192.in-addr.arpa.",
+                                        "target": "ns1.example.net.",
+                                        "cidr": "192.0.2.0/24",
+                                    },
+                                    {
+                                        "zone": "2.0.192.in-addr.arpa.",
+                                        "type": "NS",
+                                        "name": "2.0.192.in-addr.arpa.",
+                                        "target": "ns2.example.net.",
+                                        "cidr": "192.0.2.0/24",
+                                    },
+                                ],
+                            },
+                        },
+                        "rfc2317_subzones": {
+                            "summary": "Two RFC 2317 subzones (/32 and /30) in one /24",
+                            "value": {
+                                "zones": [
+                                    {
+                                        "zone": "5/32.0.0.10.in-addr.arpa.",
+                                        "method": "rfc2317",
+                                        "parent_zone": "0.0.10.in-addr.arpa.",
+                                        "cidr": "10.0.0.5/32",
+                                        "nameservers": ["host-5.example.org."],
+                                    },
+                                    {
+                                        "zone": "128/30.0.0.10.in-addr.arpa.",
+                                        "method": "rfc2317",
+                                        "parent_zone": "0.0.10.in-addr.arpa.",
+                                        "cidr": "10.0.0.128/30",
+                                        "nameservers": [
+                                            "ns1.cust.example.",
+                                            "ns2.cust.example.",
+                                        ],
+                                    },
+                                ],
+                                "records": [
+                                    {
+                                        "zone": "0.0.10.in-addr.arpa.",
+                                        "type": "NS",
+                                        "name": "5/32.0.0.10.in-addr.arpa.",
+                                        "target": "host-5.example.org.",
+                                        "cidr": "10.0.0.5/32",
+                                    },
+                                    {
+                                        "zone": "0.0.10.in-addr.arpa.",
+                                        "type": "CNAME",
+                                        "name": "5.0.0.10.in-addr.arpa.",
+                                        "target": "5.5/32.0.0.10.in-addr.arpa.",
+                                        "cidr": "10.0.0.5/32",
+                                    },
+                                    {
+                                        "zone": "0.0.10.in-addr.arpa.",
+                                        "type": "NS",
+                                        "name": "128/30.0.0.10.in-addr.arpa.",
+                                        "target": "ns1.cust.example.",
+                                        "cidr": "10.0.0.128/30",
+                                    },
+                                    {
+                                        "zone": "0.0.10.in-addr.arpa.",
+                                        "type": "NS",
+                                        "name": "128/30.0.0.10.in-addr.arpa.",
+                                        "target": "ns2.cust.example.",
+                                        "cidr": "10.0.0.128/30",
+                                    },
+                                    {
+                                        "zone": "0.0.10.in-addr.arpa.",
+                                        "type": "CNAME",
+                                        "name": "128.0.0.10.in-addr.arpa.",
+                                        "target": (
+                                            "128.128/30.0.0.10.in-addr.arpa."
+                                        ),
+                                        "cidr": "10.0.0.128/30",
+                                    },
+                                    {
+                                        "zone": "0.0.10.in-addr.arpa.",
+                                        "type": "CNAME",
+                                        "name": "129.0.0.10.in-addr.arpa.",
+                                        "target": (
+                                            "129.128/30.0.0.10.in-addr.arpa."
+                                        ),
+                                        "cidr": "10.0.0.128/30",
+                                    },
+                                    {
+                                        "zone": "0.0.10.in-addr.arpa.",
+                                        "type": "CNAME",
+                                        "name": "130.0.0.10.in-addr.arpa.",
+                                        "target": (
+                                            "130.128/30.0.0.10.in-addr.arpa."
+                                        ),
+                                        "cidr": "10.0.0.128/30",
+                                    },
+                                    {
+                                        "zone": "0.0.10.in-addr.arpa.",
+                                        "type": "CNAME",
+                                        "name": "131.0.0.10.in-addr.arpa.",
+                                        "target": (
+                                            "131.128/30.0.0.10.in-addr.arpa."
+                                        ),
+                                        "cidr": "10.0.0.128/30",
+                                    },
+                                ],
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        422: {
+            "description": (
+                "A CIDR is not a strict IPv4 /24-/32 network, a nameserver is "
+                "not a valid domain name, two CIDRs intersect, or the CIDRs "
+                "do not share one parent /24."
+            ),
+        },
+    },
+)
+def plan_reverse_delegations(request: ReverseDelegationsRequest) -> dict:
+    return reverse_delegations(
+        [(item.cidr, item.nameservers) for item in request.delegations]
+    )

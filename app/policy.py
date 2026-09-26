@@ -12,9 +12,12 @@ The module also hosts three scope-based consumers of the same primitives:
 ``audit_rules`` (per-entry impact classification inside one scope) and
 ``minimize_policy`` (minimum-cardinality equivalent rule subset inside one
 scope), plus ``allocate`` (lexicographically smallest non-overlapping subnet
-assignment inside one scope, avoiding occupied CIDRs) and ``anonymize``
+assignment inside one scope, avoiding occupied CIDRs), ``anonymize``
 (prefix-preserving keyed HMAC anonymization of bare addresses and strict
-CIDRs for safe sharing of address lists).
+CIDRs for safe sharing of address lists) and ``reverse_delegations``
+(reverse-DNS delegation plans for the IPv4 networks of one /24: direct
+in-addr.arpa NS records for a /24, RFC 2317 range-label subzones plus
+per-address parent-zone CNAMEs for /25 through /32).
 """
 
 from __future__ import annotations
@@ -1231,3 +1234,214 @@ def anonymize(
         "addresses": anonymized_addresses,
         "cidrs": anonymized_cidrs,
     }
+
+
+# ---------------------------------------------------------------------------
+# reverse-delegations: reverse-DNS delegation plans for the IPv4 networks of
+# one /24.  A /24 delegates the in-addr.arpa zone directly; anything tighter
+# (/25-/32) is unrepresentable as a classful in-addr.arpa zone, so RFC 2317 is
+# used instead: a range-labelled forwardable subzone (e.g. "0/25" or "64/26",
+# here written "<last-octet-of-network-address>/<prefixlen>") receives NS
+# records while the parent /24 zone hands out per-address CNAMEs into it.
+# ---------------------------------------------------------------------------
+
+#: Prefix lengths the reverse-delegation endpoint accepts for its CIDR entries.
+REVERSE_MIN_PREFIXLEN = 24
+
+#: One RFC 1035 label: letters/digits/hyphens, not starting/ending with a
+#: hyphen, 1-63 characters.  Used to validate every dot-separated NS label.
+_DNS_LABEL_RE = re.compile(r"(?!-)[A-Za-z0-9-]{1,63}(?<!-)\Z")
+
+
+def _parse_nameserver(value: object) -> str:
+    """Validate an NS owner domain name and return its canonical FQDN text.
+
+    Names are case-insensitive, so the result is lower-cased and guaranteed to
+    carry exactly one trailing root dot.  Each dot-separated label must match
+    :data:`_DNS_LABEL_RE`, the encoded name may be at most 253 characters, and
+    a bare IPv4/IPv6 address (valid dots/digits but not a domain name) is
+    rejected.  Any invalid input raises :class:`ValueError`.
+    """
+    if not isinstance(value, str):
+        raise ValueError(
+            f"nameserver must be a string, got {type(value).__name__}"
+        )
+    text = value.strip()
+    if not text:
+        raise ValueError("nameserver must not be empty")
+    if not text.endswith("."):
+        text += "."
+    # Drop the trailing root dot before splitting labels: the empty label it
+    # implies is implicit, not a real label.
+    labels = text[:-1].split(".")
+    for label in labels:
+        if _DNS_LABEL_RE.fullmatch(label) is None:
+            raise ValueError(f"invalid nameserver domain name {value!r}")
+    # RFC 1035 wire encoding limit expressed textually: at most 253
+    # characters excluding the trailing root dot.
+    if len(text) - 1 > 253:
+        raise ValueError(
+            f"nameserver domain name {value!r} exceeds 253 characters"
+        )
+    try:
+        ipaddress.ip_address(text[:-1])
+    except ValueError:
+        pass
+    else:
+        raise ValueError(
+            f"nameserver {value!r} must be a domain name, not an IP address"
+        )
+    return text.lower()
+
+
+def _parse_reverse_cidr(value: object) -> ipaddress.IPv4Network:
+    """Parse one strict IPv4 CIDR restricted to the /24-/32 range.
+
+    Unlike :func:`parse_network`, IPv6, non-strict host bits and any prefix
+    length shorter than /24 are all rejected; a bare address is rejected too
+    (the endpoint requires explicit CIDR notation).  Any invalid input raises
+    :class:`ValueError`.
+    """
+    network = parse_strict_cidr(value)
+    if not isinstance(network, ipaddress.IPv4Network):
+        raise ValueError(
+            f"reverse-delegation CIDR {value!r} must be IPv4, not IPv6"
+        )
+    if network.prefixlen < REVERSE_MIN_PREFIXLEN:
+        raise ValueError(
+            f"reverse-delegation CIDR {value!r} has prefix /"
+            f"{network.prefixlen}; only /24 through /32 are accepted"
+        )
+    return network
+
+
+def _validate_reverse_batch(
+    networks: Sequence[ipaddress.IPv4Network],
+) -> None:
+    """Reject a batch whose CIDRs span more than one /24 or intersect.
+
+    Every accepted entry lies inside exactly one parent /24; a pair from a
+    different /24 is rejected, and within one /24 any overlap (a /24 beside
+    anything, a /25 beside an intersecting /27, ...) is rejected outright so
+    the plan never needs to resolve two delegations for one address.
+    """
+    if not networks:
+        return
+    parent_24 = type(networks[0])(
+        (int(networks[0].network_address) & 0xFFFFFF00, 24)
+    )
+    for network in networks:
+        if not network.subnet_of(parent_24):
+            raise ValueError(
+                f"reverse-delegation CIDR {network} is not inside the common "
+                f"parent /24 {parent_24}; all CIDRs must share one /24"
+            )
+    ordered = sorted(
+        networks, key=lambda n: (int(n.network_address), n.prefixlen)
+    )
+    # For intervals sorted by start, any overlap implies an overlap of some
+    # consecutive pair (same check as the occupied list of /allocate).
+    for left, right in zip(ordered, ordered[1:]):
+        if left.overlaps(right):
+            raise ValueError(
+                f"reverse-delegation CIDRs {left} and {right} overlap; the "
+                f"whole batch is rejected"
+            )
+
+
+def reverse_delegations(
+    entries: Sequence[tuple[str, Sequence[str]]],
+) -> dict:
+    """Build the reverse-DNS delegation plan for one batch of CIDR/NS pairs.
+
+    Each entry is ``(cidr, nameservers)`` with a strict IPv4 CIDR in the
+    /24-/32 range and one or more NS domain names.  Every CIDR must share the
+    same parent /24 and no two CIDRs may intersect, otherwise the whole batch
+    is rejected with :class:`ValueError`; malformed CIDRs/NS names raise too.
+
+    A /24 entry delegates its ``d.c.b.a.in-addr.arpa`` zone directly: one NS
+    record at the zone apex per distinct nameserver (input order kept).  A
+    /25-/32 entry is delegated per RFC 2317 as the range-labelled subzone
+    ``<last-octet>/<prefixlen>`` beneath the parent /24: the subzone gets its
+    NS records, and every covered address gets a CNAME in the parent zone from
+    ``<n>.d.c.b.a.in-addr.arpa.`` to ``<n>.<label>.d.c.b.a.in-addr.arpa.``,
+    the PTR name the delegated subzone will own.
+
+    The response zones and records are sorted by source network address (then
+    prefix length); records of one CIDR stay grouped together, its NS records
+    first and the per-address CNAMEs ascending by last octet.  Every record
+    carries the canonical input ``cidr`` it was generated from.
+    """
+    parsed: list[tuple[ipaddress.IPv4Network, list[str]]] = []
+    for cidr, nameservers in entries:
+        network = _parse_reverse_cidr(cidr)
+        if not nameservers:
+            raise ValueError(
+                f"reverse-delegation CIDR {network} must list at least one "
+                f"nameserver"
+            )
+        # De-duplicate repeated NS targets case-insensitively, keeping the
+        # first spelling/order so the plan does not emit duplicate RRs.
+        seen: set[str] = set()
+        targets: list[str] = []
+        for raw in nameservers:
+            target = _parse_nameserver(raw)
+            if target not in seen:
+                seen.add(target)
+                targets.append(target)
+        parsed.append((network, targets))
+
+    networks = [network for network, _targets in parsed]
+    _validate_reverse_batch(networks)
+
+    zones: list[dict] = []
+    records: list[dict] = []
+    for network, targets in sorted(parsed, key=lambda item: _sort_key(item[0])):
+        octets = network.network_address.packed
+        parent = f"{octets[2]}.{octets[1]}.{octets[0]}.in-addr.arpa."
+        cidr_text = str(network)
+
+        if network.prefixlen == 24:
+            zone_name = parent
+            parent_zone = None
+            method = "direct"
+        else:
+            # RFC 2317 range label: last octet of the network address and the
+            # actual prefix length, e.g. 10.0.0.128/25 -> "128/25",
+            # 10.0.0.64/26 -> "64/26", 10.0.0.5/32 -> "5/32".
+            label = f"{octets[3]}/{network.prefixlen}"
+            zone_name = f"{label}.{parent}"
+            parent_zone = parent
+            method = "rfc2317"
+
+        zones.append({
+            "zone": zone_name,
+            "method": method,
+            "parent_zone": parent_zone,
+            "cidr": cidr_text,
+            "nameservers": targets,
+        })
+
+        for target in targets:
+            records.append({
+                "zone": parent_zone if method == "rfc2317" else zone_name,
+                "type": "NS",
+                "name": zone_name,
+                "target": target,
+                "cidr": cidr_text,
+            })
+
+        if method == "rfc2317":
+            start = int(network.network_address)
+            for offset in range(network.num_addresses):
+                address = ipaddress.IPv4Address(start + offset)
+                last = int(address) & 0xFF
+                records.append({
+                    "zone": parent,
+                    "type": "CNAME",
+                    "name": f"{last}.{parent}",
+                    "target": f"{last}.{label}.{parent}",
+                    "cidr": cidr_text,
+                })
+
+    return {"zones": zones, "records": records}

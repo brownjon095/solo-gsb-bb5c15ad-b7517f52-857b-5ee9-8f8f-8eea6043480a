@@ -9,6 +9,9 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from app.policy import (
     MINIMIZE_POLICY_RULE_LIMIT,
     _MAX_PREFIXLEN,
+    _parse_nameserver,
+    _parse_reverse_cidr,
+    _validate_reverse_batch,
     parse_address,
     parse_key_hex,
     parse_network,
@@ -496,5 +499,130 @@ class AnonymizeResponse(BaseModel):
         description=(
             "Anonymized canonical network segments, one per input CIDR, in "
             "input order, each keeping the original prefix length."
+        ),
+    )
+
+
+class ReverseDelegationEntry(BaseModel):
+    cidr: str = Field(
+        description=(
+            "Strict IPv4 CIDR to delegate; only prefix lengths /24 through "
+            "/32 are accepted, host bits must be zero, and an explicit "
+            "prefix length is required (bare addresses are rejected)."
+        ),
+    )
+    nameservers: list[str] = Field(
+        min_length=1,
+        description=(
+            "NS domain names for this delegation, in record order; "
+            "duplicate targets collapse to one NS record."
+        ),
+    )
+
+    @field_validator("cidr")
+    @classmethod
+    def _validate_cidr(cls, value: str) -> str:
+        # Re-parsed for the 422 response; the endpoint also parses to build
+        # the plan, so the message must stay identical here and there.
+        _parse_reverse_cidr(value)
+        return value
+
+    @field_validator("nameservers")
+    @classmethod
+    def _validate_nameservers(cls, values: list[str]) -> list[str]:
+        for value in values:
+            _parse_nameserver(value)
+        return values
+
+
+class ReverseDelegationsRequest(BaseModel):
+    delegations: list[ReverseDelegationEntry] = Field(
+        default_factory=list,
+        description=(
+            "CIDR/NS pairs sharing one parent /24. Every CIDR must be a "
+            "strict IPv4 /24-/32 network; the whole batch is rejected when "
+            "two CIDRs intersect or their parent /24s differ."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_batch(self) -> "ReverseDelegationsRequest":
+        # Same-/24 and overlap checks span entries, so they belong to the
+        # whole-model validator; the ValueError becomes an HTTP 422.
+        networks = [
+            _parse_reverse_cidr(entry.cidr) for entry in self.delegations
+        ]
+        _validate_reverse_batch(networks)
+        return self
+
+
+class ReverseZone(BaseModel):
+    zone: str = Field(
+        description=(
+            "FQDN of the delegated zone: the in-addr.arpa zone for a direct "
+            "/24 delegation, or the RFC 2317 range-labelled subzone "
+            "(e.g. '0/25.0.0.10.in-addr.arpa.') for a /25-/32 delegation."
+        ),
+    )
+    method: Literal["direct", "rfc2317"] = Field(
+        description=(
+            "'direct' for a /24 (in-addr.arpa NS); 'rfc2317' for /25-/32 "
+            "(range-label subzone NS plus parent-zone CNAMEs)."
+        ),
+    )
+    parent_zone: str | None = Field(
+        description=(
+            "Parent /24 in-addr.arpa zone that publishes the CNAMEs for an "
+            "RFC 2317 delegation; null for a direct /24 delegation."
+        ),
+    )
+    cidr: str = Field(description="Canonical input CIDR that produced this zone.")
+    nameservers: list[str] = Field(
+        description=(
+            "Canonical FQDN NS targets (lower-case, single trailing dot), "
+            "one per distinct input nameserver, in first-seen order."
+        ),
+    )
+
+
+class ReverseRecord(BaseModel):
+    zone: str = Field(
+        description=(
+            "Zone that must publish this record: the in-addr.arpa zone for "
+            "direct /24 NS records, or the parent /24 zone for RFC 2317 NS "
+            "and CNAME records."
+        ),
+    )
+    type: Literal["NS", "CNAME"] = Field(description="DNS record type.")
+    name: str = Field(
+        description=(
+            "Owner name (FQDN): the delegated zone name for NS records; the "
+            "per-address reverse name 'n.d.c.b.a.in-addr.arpa.' for CNAMEs."
+        ),
+    )
+    target: str = Field(
+        description=(
+            "Record target (FQDN): an NS host for NS records; the PTR name "
+            "inside the RFC 2317 subzone for CNAME records."
+        ),
+    )
+    cidr: str = Field(
+        description="Canonical input CIDR this record was generated from.",
+    )
+
+
+class ReverseDelegationsResponse(BaseModel):
+    zones: list[ReverseZone] = Field(
+        description=(
+            "Delegated zones sorted by source network address, then prefix "
+            "length; one zone per input CIDR."
+        ),
+    )
+    records: list[ReverseRecord] = Field(
+        description=(
+            "NS and CNAME records sorted by source network address (then "
+            "prefix length), keeping all records of one input CIDR grouped: "
+            "its NS records first, then per-address CNAMEs ascending for "
+            "RFC 2317 delegations."
         ),
     )

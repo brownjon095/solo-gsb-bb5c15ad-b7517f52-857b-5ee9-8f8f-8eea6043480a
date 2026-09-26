@@ -12,6 +12,8 @@ import pytest
 from app.policy import (
     _anonymize_address,
     _normalize_family,
+    _parse_nameserver,
+    _parse_reverse_cidr,
     allocate,
     anonymize,
     audit_rules,
@@ -23,6 +25,7 @@ from app.policy import (
     parse_key_hex,
     parse_network,
     parse_strict_cidr,
+    reverse_delegations,
     TRANSITION_KEYS,
 )
 
@@ -1630,3 +1633,274 @@ def test_parse_strict_cidr_rejects_host_bits():
 def test_anonymize_rejects_bare_address_in_cidrs():
     with pytest.raises(ValueError):
         anonymize("00" * 32, [], ["10.0.0.1"])
+
+# ---------------------------------------------------------------------------
+# reverse-delegations: in-addr.arpa / RFC 2317 delegation plans.
+# ---------------------------------------------------------------------------
+
+
+def test_reverse_direct_slash24_delegation():
+    result = reverse_delegations([("192.0.2.0/24", ["ns1.example.net"])])
+    assert result["zones"] == [{
+        "zone": "2.0.192.in-addr.arpa.",
+        "method": "direct",
+        "parent_zone": None,
+        "cidr": "192.0.2.0/24",
+        "nameservers": ["ns1.example.net."],
+    }]
+    assert result["records"] == [{
+        "zone": "2.0.192.in-addr.arpa.",
+        "type": "NS",
+        "name": "2.0.192.in-addr.arpa.",
+        "target": "ns1.example.net.",
+        "cidr": "192.0.2.0/24",
+    }]
+
+
+def test_reverse_slash25_rfc2317_ns_and_cnames():
+    result = reverse_delegations([
+        ("10.0.0.128/25", ["ns1.cust.example", "ns2.cust.example"]),
+    ])
+    assert result["zones"] == [{
+        "zone": "128/25.0.0.10.in-addr.arpa.",
+        "method": "rfc2317",
+        "parent_zone": "0.0.10.in-addr.arpa.",
+        "cidr": "10.0.0.128/25",
+        "nameservers": ["ns1.cust.example.", "ns2.cust.example."],
+    }]
+    records = result["records"]
+    # Two NS records first, then one CNAME per covered address (128..255).
+    assert [r["type"] for r in records[:2]] == ["NS", "NS"]
+    cnames = records[2:]
+    assert len(cnames) == 128
+    assert cnames[0] == {
+        "zone": "0.0.10.in-addr.arpa.",
+        "type": "CNAME",
+        "name": "128.0.0.10.in-addr.arpa.",
+        "target": "128.128/25.0.0.10.in-addr.arpa.",
+        "cidr": "10.0.0.128/25",
+    }
+    assert cnames[-1]["name"] == "255.0.0.10.in-addr.arpa."
+    assert cnames[-1]["target"] == "255.128/25.0.0.10.in-addr.arpa."
+    # CNAME owner names are strictly ascending by last octet.
+    owners = [int(r["name"].split(".", 1)[0]) for r in cnames]
+    assert owners == list(range(128, 256))
+
+
+def test_reverse_slash32_rfc2317_single_address():
+    result = reverse_delegations([("10.0.0.5/32", ["host-5.example.org"])])
+    assert result["zones"][0]["zone"] == "5/32.0.0.10.in-addr.arpa."
+    assert result["records"] == [
+        {
+            "zone": "0.0.10.in-addr.arpa.",
+            "type": "NS",
+            "name": "5/32.0.0.10.in-addr.arpa.",
+            "target": "host-5.example.org.",
+            "cidr": "10.0.0.5/32",
+        },
+        {
+            "zone": "0.0.10.in-addr.arpa.",
+            "type": "CNAME",
+            "name": "5.0.0.10.in-addr.arpa.",
+            "target": "5.5/32.0.0.10.in-addr.arpa.",
+            "cidr": "10.0.0.5/32",
+        },
+    ]
+
+
+def test_reverse_non_octet_boundary_prefix_uses_network_last_octet():
+    result = reverse_delegations([("172.16.5.192/26", ["ns.example"])])
+    assert result["zones"][0]["zone"] == "192/26.5.16.172.in-addr.arpa."
+    cnames = [r for r in result["records"] if r["type"] == "CNAME"]
+    assert len(cnames) == 64
+    assert cnames[0]["target"] == "192.192/26.5.16.172.in-addr.arpa."
+    assert cnames[-1]["target"] == "255.192/26.5.16.172.in-addr.arpa."
+
+
+def test_reverse_zones_and_records_sorted_by_network_address():
+    # Three disjoint /25-/32 networks in one /24, input deliberately
+    # shuffled; both zones and record groups must come back sorted by
+    # network address (5/32 before 64/27 before 128/30).  A direct /24
+    # delegation cannot share a batch with anything (it would overlap or
+    # leave the parent /24), so it is covered by its own test above.
+    result = reverse_delegations([
+        ("10.0.0.128/30", ["ns-b.example"]),
+        ("10.0.0.64/27", ["ns-a.example"]),
+        ("10.0.0.5/32", ["ns-c.example"]),
+    ])
+    assert [z["cidr"] for z in result["zones"]] == [
+        "10.0.0.5/32", "10.0.0.64/27", "10.0.0.128/30",
+    ]
+    # Group boundaries in the flat record list follow the same order.
+    group_order = []
+    for record in result["records"]:
+        if not group_order or group_order[-1] != record["cidr"]:
+            group_order.append(record["cidr"])
+    assert group_order == ["10.0.0.5/32", "10.0.0.64/27", "10.0.0.128/30"]
+    # Within each group every NS record precedes the CNAME records.
+    for cidr in group_order:
+        types = [r["type"] for r in result["records"] if r["cidr"] == cidr]
+        assert types[0] == "NS"
+        assert types[1:] == ["CNAME"] * (len(types) - 1)
+
+
+def test_reverse_every_record_carries_its_source_cidr():
+    result = reverse_delegations([
+        ("10.0.0.0/26", ["ns1.example"]),
+        ("10.0.0.64/27", ["ns2.example"]),
+    ])
+    counts = {}
+    for record in result["records"]:
+        counts[record["cidr"]] = counts.get(record["cidr"], 0) + 1
+    # /26: 1 NS + 64 CNAMEs; /27: 1 NS + 32 CNAMEs.
+    assert counts == {"10.0.0.0/26": 65, "10.0.0.64/27": 33}
+
+
+def test_reverse_nameservers_normalized_and_deduplicated():
+    # Missing trailing dot is appended; upper case is folded; a duplicate
+    # target spelling collapses to one NS record, first order kept.
+    result = reverse_delegations([
+        ("192.0.2.0/24", ["NS1.Example.NET", "ns1.example.net.", "ns2.x.test"]),
+    ])
+    assert result["zones"][0]["nameservers"] == [
+        "ns1.example.net.", "ns2.x.test.",
+    ]
+    assert [r["target"] for r in result["records"]] == [
+        "ns1.example.net.", "ns2.x.test.",
+    ]
+
+
+def test_reverse_empty_batch():
+    assert reverse_delegations([]) == {"zones": [], "records": []}
+
+
+def test_parse_reverse_cidr_accepts_slash24_through_slash32():
+    for prefixlen in range(24, 33):
+        network = _parse_reverse_cidr(f"10.0.0.0/{prefixlen}")
+        assert network.prefixlen == prefixlen
+    # Non-zero starting addresses aligned to the prefix are fine.
+    assert str(_parse_reverse_cidr("10.0.0.128/25")) == "10.0.0.128/25"
+    assert str(_parse_reverse_cidr("10.0.0.1/32")) == "10.0.0.1/32"
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "10.0.0.0/23",      # prefix too short
+        "10.0.0.0/8",
+        "10.0.0.1/24",      # host bits set
+        "10.0.0.1",         # bare address: explicit prefix required
+        "2001:db8::/120",   # IPv6
+        "bogus",
+        "10.0.0.0/33",
+        "",
+    ],
+)
+def test_parse_reverse_cidr_rejects_invalid(bad):
+    with pytest.raises(ValueError):
+        _parse_reverse_cidr(bad)
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("ns1.example.net", "ns1.example.net."),
+        ("NS1.Example.NET.", "ns1.example.net."),
+        ("a.b.c.", "a.b.c."),
+        ("x", "x."),
+    ],
+)
+def test_parse_nameserver_canonicalizes(raw, expected):
+    assert _parse_nameserver(raw) == expected
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "",
+        "-bad.example",        # label starts with hyphen
+        "bad-.example",        # label ends with hyphen
+        "exa mple.net",        # whitespace inside
+        "exa..mple.net",       # empty label
+        ".example.net.",       # leading dot (empty first label)
+        "10.0.0.1",            # bare IPv4
+        "10.0.0.1.",           # trailing-dot IPv4
+        "2001:db8::1",         # bare IPv6
+        "x" * 64 + ".test",    # label too long
+        "a." + "b." * 127 + "c",  # name over 253 chars
+        None,
+        10,
+    ],
+)
+def test_parse_nameserver_rejects_invalid(bad):
+    with pytest.raises(ValueError):
+        _parse_nameserver(bad)
+
+
+def test_reverse_rejects_overlapping_cidrs():
+    with pytest.raises(ValueError, match="overlap"):
+        reverse_delegations([
+            ("10.0.0.0/25", ["a.example"]),
+            ("10.0.0.64/26", ["b.example"]),
+        ])
+    # A /24 beside anything in that /24 is an overlap as well.
+    with pytest.raises(ValueError, match="overlap"):
+        reverse_delegations([
+            ("10.0.0.0/24", ["a.example"]),
+            ("10.0.0.0/32", ["b.example"]),
+        ])
+
+
+def test_reverse_rejects_different_parent_24():
+    with pytest.raises(ValueError, match="parent /24"):
+        reverse_delegations([
+            ("10.0.0.0/25", ["a.example"]),
+            ("10.0.1.0/25", ["b.example"]),
+        ])
+
+
+def test_reverse_rejects_empty_nameserver_list():
+    with pytest.raises(ValueError, match="at least one nameserver"):
+        reverse_delegations([("10.0.0.0/25", [])])
+
+
+def test_reverse_rejects_bad_nameserver_text():
+    with pytest.raises(ValueError, match="nameserver"):
+        reverse_delegations([("10.0.0.0/25", ["not a name"])])
+
+
+@pytest.mark.parametrize("prefixlen", range(25, 33))
+def test_reverse_rfc2317_plan_covers_every_prefix_length(prefixlen):
+    # One /p block at the lowest aligned address: NS + 2**(32-p) CNAMEs.
+    count = 1 << (32 - prefixlen)
+    cidr = f"198.51.100.0/{prefixlen}"
+    result = reverse_delegations([(cidr, ["ns.example"])])
+    zone = result["zones"][0]
+    assert zone["zone"] == f"0/{prefixlen}.100.51.198.in-addr.arpa."
+    assert zone["method"] == "rfc2317"
+    records = result["records"]
+    assert len(records) == 1 + count
+    assert records[0]["type"] == "NS"
+    owners = [
+        int(r["name"].split(".", 1)[0])
+        for r in records[1:]
+    ]
+    assert owners == list(range(count))
+    # Every CNAME points into the same labelled subzone.
+    assert all(
+        r["target"].split(".", 1)[1] == f"0/{prefixlen}.100.51.198.in-addr.arpa."
+        for r in records[1:]
+    )
+
+
+def test_reverse_sibling_delegations_partition_the_parent_without_gaps():
+    # Two /25 halves of one /24 are disjoint and together own every CNAME.
+    result = reverse_delegations([
+        ("10.0.0.0/25", ["low.example"]),
+        ("10.0.0.128/25", ["high.example"]),
+    ])
+    cnames = [r for r in result["records"] if r["type"] == "CNAME"]
+    owners = sorted(int(r["name"].split(".", 1)[0]) for r in cnames)
+    assert owners == list(range(256))
+    assert all(r["cidr"] == "10.0.0.0/25" for r in cnames[:128])
+    assert all(r["cidr"] == "10.0.0.128/25" for r in cnames[128:])
